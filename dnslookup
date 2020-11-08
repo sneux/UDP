@@ -1,0 +1,384 @@
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import socket
+import struct
+import sys
+import typing
+
+class Decoder:
+
+    base: bytes
+    buf: bytes
+
+    def __init__(self, buf: bytes) -> None:
+        self.base = buf
+        self.buf = buf
+
+    def chunk(self, sz: int) -> bytes:
+        chnk, self.buf = self.buf[:sz], self.buf[sz:]
+        return chnk
+
+    def struct(self, fmt: str) -> typing.Tuple:
+        sz = struct.calcsize(fmt)
+        chnk = self.chunk(sz)
+        return struct.unpack(f"!{fmt}", chnk)
+
+    def swap(self, buf: bytes) -> bytes:
+        self.buf, cur = buf, self.buf
+        return cur
+
+    def skip(self, n: int) -> None:
+        self.buf = self.buf[n:]
+
+    def label(self) -> typing.Union[bytes, int]:
+        length = self.buf[0]
+        # print(f"length: {bin(length)}")
+        # label compression
+        if length & 0xc0:
+            # print(f"compressed!")
+            (offset,) = self.struct("H")
+            offset &= ~0xc000
+            # print(f"returning {offset}")
+            return offset
+        else:
+            self.skip(1)
+            (val,) = self.struct(f"{length}s")
+        # print(f"label: {val}")
+        return val
+
+    def _labels(self) -> typing.Iterable[str]:
+        while True:
+            label = self.label()
+            if label == b"":
+                break
+            elif isinstance(label, int):
+                cur = self.swap(self.base[label:])
+                yield self.name()
+                self.swap(cur)
+                break
+            yield label.decode()
+
+    def name(self) -> str:
+        return ".".join(self._labels())
+
+class Encoder:
+
+    buf: bytearray
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def chunk(self, chnk: bytes) -> Encoder:
+        self.buf += chnk
+        return self
+
+    def struct(self, fmt: str, *args: typing.Any) -> Encoder:
+        self.buf += struct.pack(f"!{fmt}", *args)
+        return self
+
+    def label(self, val: bytes) -> Encoder:
+        length = len(val)
+        return self.struct(f"B{length}s", length, val)
+
+    def name(self, val: str) -> Encoder:
+        for part in val.encode().split(b"."):
+            self.label(part)
+        if not val.endswith("."):
+            self.label(b"")
+        return self
+
+    def __bytes__(self) -> bytes:
+        return bytes(self.buf)
+
+# DNS packets are comprised of 5 sections:
+# 1. Header
+# 2. Question
+# 3. Answer (resource)
+# 4. Authority (resource)
+# 5. Additional (resource)
+
+QR_QUERY = True
+QR_REPLY = False
+
+OPCODE_QUERY = 0
+
+RCODE_NO_ERROR = 0
+
+class Header(typing.NamedTuple):
+    id: int
+    qr: bool
+    opcode: int
+    aa: bool
+    tc: bool
+    rd: bool
+    ra: bool
+    z: int
+    rcode: int
+    qdcount: int = 0
+    ancount: int = 0
+    nscount: int = 0
+    arcount: int = 0
+
+    @staticmethod
+    def decode(decoder: Decoder) -> Header:
+        id, flags, qdcount, ancount, nscount, arcount = decoder.struct("HHHHHH")
+        rcode = (flags >> 12) & 0xf
+        z = (flags >> 9) & 7
+        ra = (flags >> 8) & 1
+        rd = (flags >> 7) & 1
+        tc = (flags >> 6) & 1
+        aa = (flags >> 5) & 1
+        opcode = (flags >> 1) & 0xf
+        qr = flags & 1
+        # print(
+        #     f"id: {id}",
+        #     f"flags: {bin(flags)}",
+        #     f"qdcount: {qdcount}",
+        #     f"nscount: {nscount}",
+        #     f"arcount: {arcount}",
+        #     sep="\n",
+        # )
+        return Header(
+            id, qr, opcode, aa, tc, rd, ra, z, rcode, qdcount, ancount, nscount, arcount
+        )
+
+    def encode(self, encoder: Encoder) -> Encoder:
+        flags = (self.rcode << 12) \
+            | (self.z << 9) \
+            | (self.ra << 8) \
+            | (self.rd << 7) \
+            | (self.tc << 6) \
+            | (self.aa << 5) \
+            | (self.opcode << 1) \
+            | self.qr
+        return encoder.struct(
+            "HHHHHH",
+            self.id, flags, self.qdcount, self.ancount, self.nscount, self.arcount,
+        )
+
+TYPE_A: int = 0x1
+TYPE_NS: int = 0x2
+TYPE_AAAA: int = 0x1c
+
+CLASS_IN: int = 0x1
+
+class Question(typing.NamedTuple):
+    qname: str
+    qtype: int
+    qclass: int
+
+    @staticmethod
+    def decode(decoder: Decoder) -> Question:
+        # print("decoding question")
+        qname = decoder.name()
+        # print(f"qname: {qname}")
+        qtype, qclass = decoder.struct("HH")
+        # print(f"qtype: {qtype}", f"qclass: {qclass}", sep="\n")
+        return Question(qname, qtype, qclass)
+
+    def encode(self, encoder: Encoder) -> Encoder:
+        return encoder.name(self.qname).struct("HH", self.qtype, self.qclass)
+
+class Resource(typing.NamedTuple):
+    name: str
+    type: int
+    class_: int
+    ttl: int
+    rdlength: int
+    rdata: typing.Union[bytes, str]
+
+    @staticmethod
+    def decode(decoder: Decoder) -> Resource:
+        # print("decoding resource")
+        name = decoder.name()
+        # print(f"name: {name}")
+        type, class_, ttl, rdlength = decoder.struct("HHIH")
+        # print(f"type: {type}", f"class: {class_}", f"ttl: {ttl}", f"rdlength: {rdlength}", sep="\n")
+        if type == TYPE_A:
+            # decode address
+            rdata = socket.inet_ntoa(decoder.chunk(4))
+        elif type == TYPE_AAAA:
+            # decode v6 address
+            rdata = socket.inet_ntop(socket.AF_INET6, decoder.chunk(16))
+        elif type == TYPE_NS:
+            # decode name
+            rdata = decoder.name()
+        else:
+            # leave as raw bytes
+            rdata = decoder.chunk(rdlength)
+        # print(f"rdata: {rdata}")
+        return Resource(name, type, class_, ttl, rdlength, rdata)
+
+    def encode(self, encoder: Encoder) -> Encoder:
+        encoder.name(self.name).struct(
+            "HHIH",
+            self.type, self.class_, self.ttl, self.rdlength,
+        )
+        if type == TYPE_A:
+            encoder.chunk(socket.inet_aton(self.rdata))
+        elif type == TYPE_AAAA:
+            encoder.chunk(socket.inet_pton(socket.AF_INET6, self.rdata))
+        elif type == TYPE_NS:
+            encoder.name(self.rdata)
+        else:
+            encoder.chunk(self.rdata)
+        return encoder
+
+@dataclasses.dataclass
+class Message:
+    header: Header
+    questions: typing.Sequence[Question] = ()
+    answers: typing.Sequence[Resource] = ()
+    authorities: typing.Sequence[Resource] = ()
+    additional: typing.Sequence[Resource] = ()
+
+    def __post_init__(self):
+        # fill in the resource counts for the header
+        self.header = self.header._replace(
+            qdcount=len(self.questions),
+            ancount=len(self.answers),
+            nscount=len(self.authorities),
+            arcount=len(self.additional),
+        )
+
+    @staticmethod
+    def decode(decoder: typing.Union[bytes, Decoder]) -> Message:
+        if isinstance(decoder, bytes):
+            decoder = Decoder(decoder)
+        header = Header.decode(decoder)
+        questions = [Question.decode(decoder) for _ in range(header.qdcount)]
+        answers = [Resource.decode(decoder) for _ in range(header.ancount)]
+        authorities = [Resource.decode(decoder) for _ in range(header.nscount)]
+        additional = [Resource.decode(decoder) for _ in range(header.arcount)]
+        return Message(header, questions, answers, authorities, additional)
+
+    def encode(self, encoder: typing.Optional[Encoder] = None) -> Encoder:
+        if encoder is None:
+            encoder = Encoder()
+        self.header.encode(encoder)
+        for rc in (*self.questions, *self.answers, *self.authorities, *self.additional):
+            rc.encode(encoder)
+        return encoder
+
+DNS_PORT: int = 53
+
+RECV_BUF_SZ: int = 4096
+
+class Client:
+    sock: socket.socket
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(self, addr: str, msg: Message) -> Message:
+        enc = bytes(msg.encode())
+        # print(f"sending: {enc.hex()}")
+        self.sock.sendto(enc, (addr, DNS_PORT))
+        buf, _ = self.sock.recvfrom(RECV_BUF_SZ)
+        # print(f"received: {buf.hex()}")
+        return Message.decode(buf)
+
+    def __enter__(self) -> Client:
+        return self
+
+    def __exit__(self, *_: typing.Any) -> None:
+        self.sock.close()
+
+def _query_A(name: str) -> Message:
+    return Message(
+        Header(
+            id=0xdb42,
+            qr=QR_QUERY,
+            opcode=OPCODE_QUERY,
+            aa=False,
+            tc=False,
+            rd=False,  # disabling recursion
+            ra=False,
+            z=0,
+            rcode=RCODE_NO_ERROR,
+        ),
+        [Question(
+            qname=name,
+            qtype=TYPE_A,
+            qclass=CLASS_IN,
+        )],
+    )
+
+def resolve(client: Client, server: str, name: str) -> typing.Optional[str]:
+    # build a message querying for A records for the given name
+    msg = _query_A(name)
+
+    # we want to keep trying nameservers until we get an actual answer
+    while server:
+        # print header
+        print("-" * 64)
+        print(f"DNS server to query: {server}")
+
+        rsp = client.send(server, msg)
+        print_response(rsp)
+
+        if rsp.answers:
+            # we received a direct answer to our question
+            return rsp.answers[0].rdata
+
+        # otherwise check for authorities
+        if not rsp.authorities:
+            raise RuntimeError(f"reached a deadend with @{server}")
+
+        # try another intermediate nameserver
+        server_name = rsp.authorities[0].rdata
+
+        # check the additional records for a matching A
+        for rec in rsp.additional:
+            if rec.type == TYPE_A and rec.name == server_name:
+                server = rec.rdata
+                break
+
+    # failed to resolve server
+    return None
+
+def print_response(rsp: Message) -> None:
+    # print the details for a DNS response
+    header = rsp.header
+    print(
+        "Reply received. Content overview:\n"
+        f"\t{header.ancount} Answers.\n"
+        f"\t{header.nscount} Intermediate Name Servers.\n"
+        f"\t{header.arcount} Additional Information Records."
+    )
+    print("Answers section:")
+    for rec in rsp.answers:
+        print(f"\tName: {rec.name}\tIP: {rec.rdata}")
+    print("Authoritative section:")
+    for rec in rsp.authorities:
+        print(f"\tName: {rec.name}\tName Server: {rec.rdata}")
+    print("Additional information section:")
+    for rec in rsp.additional:
+        print(f"\tName: {rec.name}\tIP: {rec.rdata}")
+
+def main(args: argparse.Namespace) -> None:
+    name = args.domain_name
+    with Client() as client:
+        address = resolve(client, args.root_dns_ip, name)
+        if not address:
+            print(f"failed to resolve {name}!", file=sys.stderr)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="The DNS lookup client uses iterative queries to resolve a given domain name.")
+    parser.add_argument(
+        "domain_name",
+        nargs="?",
+        default="cs.fiu.edu",
+        help="the domain name (e.g., cs.fiu.edu) to be resolved",
+    )
+    parser.add_argument(
+        "root_dns_ip",
+        nargs="?",
+        default="202.12.27.33",
+        help="the IP address (e.g., 202.12.27.33) of a root DNS server on the Internet",
+    )
+    args = parser.parse_args()
+    main(args)
